@@ -220,13 +220,30 @@ def run(handler: Handler, host: str = "0.0.0.0", port: Optional[int] = None,
 
 
 def main() -> None:
-    """CLI entry point — requires MCP_HANDLER env var pointing to a dotted import path."""
+    """CLI entry point.
+
+    Resolution order for the handler:
+      1. ``$MCP_HANDLER`` env var (``module.path:function_name``).
+      2. Built-in ``example.main:handler`` (so `docker run mcp-service` works
+         without extra config — useful for smoke-testing).
+    """
     import importlib
-    handler_path = os.getenv("MCP_HANDLER")
-    if not handler_path:
-        print("Set MCP_HANDLER=module.path:function_name")
-        raise SystemExit(1)
+    handler_path = os.getenv("MCP_HANDLER") or "example.main:handler"
     module_path, _, fn_name = handler_path.partition(":")
-    module = importlib.import_module(module_path)
-    handler = getattr(module, fn_name)
+    if not fn_name:
+        raise SystemExit(
+            f"MCP_HANDLER={handler_path!r} must be of the form 'module.path:function'"
+        )
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:
+        raise SystemExit(
+            f"Could not import handler module {module_path!r}: {e}. "
+            "Set MCP_HANDLER to a module on PYTHONPATH."
+        ) from e
+    handler = getattr(module, fn_name, None)
+    if handler is None:
+        raise SystemExit(
+            f"Module {module_path!r} has no attribute {fn_name!r}"
+        )
     run(handler)

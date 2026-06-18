@@ -1,0 +1,40 @@
+# Reduce Docker build context size — keep only what's needed to install
+# mcp-service and ship its runtime.
+
+.git
+.github
+.gitignore
+.coverage
+.coverage.*
+htmlcov
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.idea
+.vscode
+*.swp
+.DS_Store
+node_modules
+
+# Tests, docs are not required in the production image.
+# (example/ IS shipped so the bundled handler works out-of-the-box;
+# override MCP_HANDLER in your own image to plug your handler in.)
+tests
+docs
+PLAN.md
+
+# Local config / secrets.
+.env
+.env.*
+!.env.example
+!.env.production
+
+# VCS / build / cache artifacts.
+*.egg-info
+build
+dist
+__pycache__
+*.py[cod]
+*$py.class
+*.log
+oauth_storage

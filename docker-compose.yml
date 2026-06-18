@@ -1,0 +1,48 @@
+# Production-ready compose file.
+#
+#   docker compose up                  # OAuth AS enabled, mcp:read/write/admin scopes
+#   docker compose --profile example up # also runs the bundled example handler
+#
+# Override any value via an `.env` file or `--env-file` flag.
+
+services:
+  mcp-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mcp-service:dev
+    container_name: mcp-service
+    restart: unless-stopped
+    ports:
+      - "${MCP_PORT:-8000}:8000"
+    environment:
+      MCP_PORT: "8000"
+      MCP_REQUIRE_AUTH: "${MCP_REQUIRE_AUTH:-false}"
+      MCP_API_KEY: "${MCP_API_KEY:-}"
+      OAUTH_ENABLED: "${OAUTH_ENABLED:-true}"
+      OAUTH_AUTO_APPROVE: "${OAUTH_AUTO_APPROVE:-true}"
+      OAUTH_STORAGE_DIR: /var/lib/mcp-service/oauth
+      OAUTH_ACCESS_TOKEN_TTL: "${OAUTH_ACCESS_TOKEN_TTL:-3600}"
+      OAUTH_REFRESH_TOKEN_TTL: "${OAUTH_REFRESH_TOKEN_TTL:-2592000}"
+      OAUTH_AUTH_CODE_TTL: "${OAUTH_AUTH_CODE_TTL:-600}"
+      OAUTH_SUPPORTED_SCOPES: "${OAUTH_SUPPORTED_SCOPES:-mcp:read mcp:write mcp:admin}"
+      MCP_HANDLER: "${MCP_HANDLER:-example.main:handler}"
+    volumes:
+      - mcp-data:/var/lib/mcp-service/oauth
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    # Drop capabilities, run as non-root (uid 65532 baked into the image),
+    # read-only root filesystem except for the data volume.
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  mcp-data:
+    name: mcp-service-data
