@@ -15,7 +15,7 @@ from typing import Optional
 from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from .models import AuthorizationServerMetadata, TokenResponse
