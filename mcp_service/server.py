@@ -49,6 +49,8 @@ from mcp_service.oauth.storage import (
     get_token_store,
 )
 
+__version__ = "0.1.0"
+
 Handler = Callable[[dict], Optional[dict]]
 
 _log = logging.getLogger(__name__)
@@ -64,8 +66,42 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
     """
     cfg = get_config()
 
-    app = FastAPI(title=title, version="0.1.0",
-                  description="MCP HTTP server with OAuth 2.1")
+    app = FastAPI(
+        title=title,
+        version=__version__,
+        description=(
+            "Model Context Protocol HTTP server with built-in OAuth 2.1 "
+            "Authorization Server (RFC 8414, 7636, 7591, 6749). "
+            "Mount this under any ASGI server, or call `run()` to start the "
+            "bundled uvicorn worker.\n\n"
+            "**Quickstart:**\n"
+            "```bash\n"
+            "curl -X POST http://localhost:8000/mcp \\\n"
+            "  -H 'Content-Type: application/json' \\\n"
+            "  -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'\n"
+            "```\n\n"
+            "**OAuth flow:** see [ERRORS.md](https://github.com/AvengerMoJo/mcp-service/blob/main/docs/ERRORS.md) "
+            "for the full error catalog."
+        ),
+        contact={"name": "AvengerMoJo", "url": "https://github.com/AvengerMoJo/mcp-service"},
+        license_info={"name": "MIT", "url": "https://opensource.org/licenses/MIT"},
+        openapi_tags=[
+            {"name": "mcp", "description": "JSON-RPC 2.0 endpoints — POST MCP requests here."},
+            {"name": "oauth", "description": "OAuth 2.1 Authorization Server endpoints."},
+            {"name": "health", "description": "Liveness / readiness probes."},
+        ],
+        swagger_ui_init_oauth={
+            "clientId": "swagger-ui-preview-client",
+            "usePkceWithAuthorizationCodeGrant": True,
+        },
+        servers=[
+            {"url": "http://localhost:8000", "description": "Local development"},
+        ],
+    )
+
+    # Carry the version through to the OpenAPI schema so external API clients
+    # see exactly which version they are talking to.
+    app.openapi_version = "3.1.0"
 
     # Trust X-Forwarded-Proto/Host from Cloudflare or any reverse proxy
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
@@ -89,13 +125,43 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
 
     # ── health ────────────────────────────────────────────────────────────────
 
-    @app.get("/health")
+    @app.get(
+        "/health",
+        summary="Liveness probe",
+        description="Returns 200 if the process is running. Use `/healthz` for a deep check.",
+        tags=["health"],
+        responses={
+            200: {
+                "description": "Process is up",
+                "content": {"application/json": {"example": {"status": "ok", "server": title}}},
+            },
+        },
+    )
     async def health():
         return {"status": "ok", "server": title}
 
     # ── deep health ───────────────────────────────────────────────────────────
 
-    @app.get("/healthz")
+    @app.get(
+        "/healthz",
+        summary="Readiness probe (deep)",
+        description=(
+            "Returns 200 with per-check details when all checks pass; 503 if any "
+            "critical check fails (e.g. storage directory not writable)."
+        ),
+        tags=["health"],
+        responses={
+            200: {"description": "All checks passed"},
+            503: {
+                "description": "One or more checks failed",
+                "content": {"application/json": {"example": {
+                    "status": "degraded",
+                    "server": title,
+                    "checks": {"token_store": {"status": "error", "detail": "permission denied"}},
+                }}},
+            },
+        },
+    )
     async def healthz():
         """Deep health check — includes token store and client store status.
 
@@ -137,15 +203,90 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
 
     # ── OAuth-gated endpoint (/oauth POST) ────────────────────────────────────
 
-    @app.post("/oauth")
+    @app.post(
+        "/oauth",
+        summary="MCP endpoint (OAuth required)",
+        description=(
+            "Same JSON-RPC 2.0 contract as `/mcp`, but always requires a "
+            "valid OAuth Bearer token. Returns 401 with a `WWW-Authenticate` "
+            "challenge on missing/invalid tokens."
+        ),
+        tags=["mcp"],
+        responses={
+            200: {
+                "description": "JSON-RPC 2.0 response (or 204 for notifications)",
+                "content": {"application/json": {"example": {
+                    "jsonrpc": "2.0", "id": 1,
+                    "result": {"tools": [{"name": "ping"}]},
+                }}},
+            },
+            204: {"description": "Notification acknowledged (no body)"},
+            401: {
+                "description": "Bearer token missing or invalid",
+                "headers": {"WWW-Authenticate": {"schema": {"type": "string"}}},
+                "content": {"application/json": {"example": {
+                    "error": "invalid_token",
+                    "error_description": "Token has expired",
+                }}},
+            },
+        },
+    )
     async def mcp_oauth(raw: Request, token: RequiredOAuthToken):
         """MCP endpoint requiring a valid OAuth bearer token."""
         return await _dispatch(raw, handler, token.user_id)
 
     # ── Main MCP endpoint (/) — auth optional or enforced by MCP_REQUIRE_AUTH ─
 
-    @app.post("/mcp")
-    @app.post("/")
+    @app.post(
+        "/mcp",
+        summary="MCP endpoint (JSON-RPC 2.0)",
+        description=(
+            "Accepts JSON-RPC 2.0 requests (`initialize`, `tools/list`, "
+            "`tools/call`, `notifications/initialized`, ...). Auth is "
+            "optional by default; set `MCP_REQUIRE_AUTH=true` to enforce "
+            "either a Bearer token or the `MCP-API-Key` header."
+        ),
+        tags=["mcp"],
+        responses={
+            200: {
+                "description": "JSON-RPC 2.0 response",
+                "content": {"application/json": {"examples": {
+                    "result": {"summary": "Successful response",
+                               "value": {"jsonrpc": "2.0", "id": 1,
+                                         "result": {"tools": []}}},
+                    "error": {"summary": "Handler-issued error",
+                              "value": {"jsonrpc": "2.0", "id": 1,
+                                        "error": {"code": -32601,
+                                                  "message": "Method not found"}}},
+                }}},
+            },
+            204: {"description": "Notification acknowledged (no body)"},
+            400: {
+                "description": "Parse / invalid-request error",
+                "content": {"application/json": {"example": {
+                    "jsonrpc": "2.0", "id": None,
+                    "error": {"code": -32700, "message": "Parse error"},
+                }}},
+            },
+            401: {
+                "description": "Bearer token missing or invalid",
+                "headers": {"WWW-Authenticate": {"schema": {"type": "string"}}},
+                "content": {"application/json": {"example": {
+                    "error": "invalid_token",
+                    "error_description": "Token has expired",
+                }}},
+            },
+            500: {
+                "description": "Handler raised an unhandled exception",
+                "content": {"application/json": {"example": {
+                    "jsonrpc": "2.0", "id": 1,
+                    "error": {"code": -32603, "message": "Internal error",
+                              "data": "Traceback ..."},
+                }}},
+            },
+        },
+    )
+    @app.post("/", include_in_schema=False)
     async def mcp_main(
         raw: Request,
         token: ValidatedOAuthToken = None,
@@ -166,8 +307,23 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
 
     # ── SSE GET (keep-alive for MCP spec) ─────────────────────────────────────
 
-    @app.get("/mcp")
-    @app.get("/")
+    @app.get(
+        "/mcp",
+        summary="MCP transport info (HTTP hint)",
+        description=(
+            "GET returns the server's transport metadata. POST is the real "
+            "JSON-RPC endpoint (see above). SSE streams are not currently "
+            "supported — this server speaks HTTP request/response only."
+        ),
+        tags=["mcp"],
+        responses={
+            200: {"description": "Transport info",
+                  "content": {"application/json": {"example": {
+                      "transport": "http", "note": "POST to this endpoint",
+                  }}}},
+        },
+    )
+    @app.get("/", include_in_schema=False)
     async def mcp_sse_info():
         """Minimal SSE endpoint — tells clients this server uses HTTP transport."""
         return JSONResponse({"transport": "http", "note": "POST to this endpoint"})

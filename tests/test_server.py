@@ -311,3 +311,47 @@ async def test_docs_swagger_ui(client):
     r = await client.get("/docs")
     assert r.status_code == 200
     assert "text/html" in r.headers["content-type"]
+
+@pytest.mark.asyncio
+async def test_redoc_available(client):
+    r = await client.get("/redoc")
+    assert r.status_code == 200
+    assert "text/html" in r.headers["content-type"]
+
+
+@pytest.mark.asyncio
+async def test_openapi_documents_mcp_responses(client):
+    """The /mcp route advertises success + error responses in OpenAPI."""
+    r = await client.get("/openapi.json")
+    schema = r.json()
+    mcp = schema["paths"]["/mcp"]["post"]
+    codes = {int(c) for c in mcp["responses"].keys()}
+    assert 200 in codes
+    assert 204 in codes
+    assert 400 in codes
+    assert 500 in codes
+    examples = mcp["responses"]["200"]["content"]["application/json"].get("examples")
+    assert examples is not None
+    assert "result" in examples
+    assert "error" in examples
+
+
+@pytest.mark.asyncio
+async def test_openapi_documents_health_endpoints(client):
+    r = await client.get("/openapi.json")
+    schema = r.json()
+    assert "/health" in schema["paths"]
+    assert "/healthz" in schema["paths"]
+    codes = {int(c) for c in schema["paths"]["/healthz"]["get"]["responses"].keys()}
+    assert 200 in codes
+    assert 503 in codes
+
+
+@pytest.mark.asyncio
+async def test_openapi_includes_tags_and_contact(client):
+    r = await client.get("/openapi.json")
+    schema = r.json()
+    assert schema["info"]["license"]["name"] == "MIT"
+    assert schema["info"]["contact"]["url"].startswith("https://")
+    tag_names = {t["name"] for t in schema.get("tags", [])}
+    assert {"mcp", "oauth", "health"} <= tag_names
