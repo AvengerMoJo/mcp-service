@@ -139,10 +139,7 @@ class TokenValidator:
 
     def create_www_authenticate_header(self, error: str = "invalid_token",
                                        description: Optional[str] = None) -> str:
-        h = "Bearer"
-        if self.config.audience:
-            h += f' realm="{self.config.audience}"'
-        h += f' error="{error}"'
-        if description:
-            h += f' error_description="{description}"'
-        return h
+        from mcp_service.errors import build_www_authenticate
+        return build_www_authenticate(
+            error=error, description=description, audience=self.config.audience,
+        )

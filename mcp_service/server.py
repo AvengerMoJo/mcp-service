@@ -30,8 +30,24 @@ from fastapi.responses import JSONResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from mcp_service.config import get_config
+from mcp_service.errors import (
+    JSONRPC_INTERNAL_ERROR,
+    JSONRPC_INVALID_PARAMS,
+    JSONRPC_INVALID_REQUEST,
+    JSONRPC_METHOD_NOT_FOUND,
+    JSONRPC_PARSE_ERROR,
+    build_www_authenticate,
+    install_error_handlers,
+    jsonrpc_envelope,
+    jsonrpc_error,
+    oauth_error_response,
+)
 from mcp_service.oauth.middleware import ValidatedOAuthToken, RequiredOAuthToken
 from mcp_service.oauth import endpoints as oauth_endpoints
+from mcp_service.oauth.storage import (
+    get_client_registration_store,
+    get_token_store,
+)
 
 Handler = Callable[[dict], Optional[dict]]
 
@@ -63,6 +79,9 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
         allow_headers=["*", "Authorization", "mcp-session-id"],
     )
 
+    # Standardize uncaught errors → OAuth / RFC 7807 envelopes
+    install_error_handlers(app)
+
     # Mount OAuth AS endpoints (well-known + /oauth/*)
     if cfg.oauth.enabled and cfg.oauth.enable_authorization_server:
         app.include_router(oauth_endpoints.router)
@@ -73,6 +92,48 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok", "server": title}
+
+    # ── deep health ───────────────────────────────────────────────────────────
+
+    @app.get("/healthz")
+    async def healthz():
+        """Deep health check — includes token store and client store status.
+
+        Returns 200 with per-check details when all checks pass; 503 if any
+        critical check fails (e.g. storage directory not writable)."""
+        cfg = get_config()
+        checks: dict = {"server": "ok"}
+        critical_ok = True
+
+        if cfg.oauth.enabled:
+            try:
+                store = get_token_store()
+                checks["token_store"] = {
+                    "status": "ok",
+                    "path": str(store._path),
+                    "writable": store._path.parent.exists(),
+                }
+            except Exception as e:
+                checks["token_store"] = {"status": "error", "detail": str(e)}
+                critical_ok = False
+            try:
+                cstore = get_client_registration_store()
+                checks["client_store"] = {
+                    "status": "ok",
+                    "path": str(cstore._path),
+                }
+            except Exception as e:
+                checks["client_store"] = {"status": "error", "detail": str(e)}
+                critical_ok = False
+        else:
+            checks["oauth"] = {"status": "disabled"}
+
+        body = {
+            "status": "ok" if critical_ok else "degraded",
+            "server": title,
+            "checks": checks,
+        }
+        return _json_response(body, status_code=200 if critical_ok else 503)
 
     # ── OAuth-gated endpoint (/oauth POST) ────────────────────────────────────
 
@@ -95,10 +156,10 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
             has_oauth = token is not None
             has_key = mcp_api_key and mcp_api_key == cfg.api_key
             if not has_oauth and not has_key:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Authentication required: Bearer token or MCP-API-Key",
-                    headers={"WWW-Authenticate": 'Bearer realm="MCP Server"'},
+                return oauth_error_response(
+                    "invalid_token",
+                    "Authentication required: Bearer token or MCP-API-Key",
+                    audience=cfg.oauth.audience or "mcp_service",
                 )
         user_id = token.user_id if token else None
         return await _dispatch(raw, handler, user_id)
@@ -126,19 +187,20 @@ async def _dispatch(raw: Request, handler: Handler, user_id: Optional[str]) -> J
     try:
         body = await raw.json()
     except Exception:
-        return _json_response({"jsonrpc": "2.0", "id": None,
-                               "error": {"code": -32700, "message": "Parse error"}}, 400)
+        return _json_response(jsonrpc_envelope(None, error=jsonrpc_error(
+            JSONRPC_PARSE_ERROR, "Parse error")), 400)
 
     if not isinstance(body, dict) or body.get("jsonrpc") != "2.0" or "method" not in body:
-        return _json_response({"jsonrpc": "2.0", "id": body.get("id") if isinstance(body, dict) else None,
-                               "error": {"code": -32600, "message": "Invalid Request"}}, 400)
+        req_id = body.get("id") if isinstance(body, dict) else None
+        return _json_response(jsonrpc_envelope(req_id, error=jsonrpc_error(
+            JSONRPC_INVALID_REQUEST, "Invalid Request")), 400)
 
     try:
         resp = handler(body)
     except Exception as e:
         _log.exception("handler error")
-        return _json_response({"jsonrpc": "2.0", "id": body.get("id"),
-                               "error": {"code": -32603, "message": str(e)}}, 500)
+        return _json_response(jsonrpc_envelope(body.get("id"), error=jsonrpc_error(
+            JSONRPC_INTERNAL_ERROR, "Internal error", data=str(e))), 500)
 
     if resp is None:
         from starlette.responses import Response

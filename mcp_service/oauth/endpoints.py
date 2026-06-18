@@ -6,6 +6,9 @@ OAuth 2.1 Authorization Server endpoints.
   GET  /oauth/authorize                         — PKCE authorization (consent page or auto-approve)
   POST /oauth/authorize                         — process allow/deny
   POST /oauth/token                             — exchange code → tokens, refresh
+
+All error responses follow RFC 6749 §5.2 envelopes (`error`, `error_description`,
+`error_uri`, `state`) — see `mcp_service.errors`.
 """
 
 import json
@@ -14,10 +17,11 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode, urlparse
 
-from fastapi import APIRouter, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi import APIRouter, Form, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
+from mcp_service.errors import oauth_error_response
 from .models import AuthorizationServerMetadata, TokenResponse
 from .pkce import is_valid_code_verifier, verify_code_challenge
 from .storage import (
@@ -60,7 +64,7 @@ def _validate_redirect_uri(uri: str) -> bool:
 async def as_metadata(request: Request) -> Response:
     cfg = get_config()
     if not cfg.oauth.enabled or not cfg.oauth.enable_authorization_server:
-        raise HTTPException(status_code=501, detail="OAuth AS not enabled")
+        return oauth_error_response("server_error", "OAuth AS not enabled")
     base = _base_url(request)
     meta = AuthorizationServerMetadata(
         issuer=base,
@@ -76,7 +80,7 @@ async def as_metadata(request: Request) -> Response:
 async def protected_resource_metadata(request: Request) -> Response:
     cfg = get_config()
     if not cfg.oauth.enabled:
-        raise HTTPException(status_code=501, detail="OAuth not enabled")
+        return oauth_error_response("server_error", "OAuth not enabled")
     base = _base_url(request)
     return _json(cfg.oauth.get_protected_resource_metadata(base))
 
@@ -87,15 +91,18 @@ async def protected_resource_metadata(request: Request) -> Response:
 async def register_client(request: Request) -> Response:
     cfg = get_config()
     if not cfg.oauth.enabled or not cfg.oauth.enable_authorization_server:
-        raise HTTPException(status_code=501, detail="OAuth AS not enabled")
+        return oauth_error_response("server_error", "OAuth AS not enabled")
     try:
         body = await request.json()
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        return oauth_error_response("invalid_request", "Invalid JSON body")
 
     redirect_uris = body.get("redirect_uris", [])
     if not redirect_uris:
-        raise HTTPException(status_code=400, detail="redirect_uris is required")
+        return oauth_error_response(
+            "invalid_request",
+            "redirect_uris is required (RFC 7591 §2)",
+        )
 
     store = get_client_registration_store()
     client = store.register_client(
@@ -132,13 +139,17 @@ async def authorize_get(
 ):
     cfg = get_config()
     if not cfg.oauth.enabled or not cfg.oauth.enable_authorization_server:
-        raise HTTPException(status_code=501, detail="OAuth AS not enabled")
+        return oauth_error_response("server_error", "OAuth AS not enabled")
     if response_type != "code":
-        return RedirectResponse(f"{redirect_uri}?{urlencode({'error':'unsupported_response_type','state':state})}")
+        return RedirectResponse(
+            f"{redirect_uri}?{urlencode({'error': 'unsupported_response_type', 'state': state})}"
+        )
     if code_challenge_method != "S256":
-        return RedirectResponse(f"{redirect_uri}?{urlencode({'error':'invalid_request','error_description':'Only S256 supported','state':state})}")
+        return RedirectResponse(
+            f"{redirect_uri}?{urlencode({'error': 'invalid_request', 'error_description': 'Only S256 challenge method is supported', 'state': state})}"
+        )
     if not _validate_redirect_uri(redirect_uri):
-        raise HTTPException(status_code=400, detail="Invalid redirect_uri")
+        return oauth_error_response("invalid_request", "Invalid redirect_uri")
 
     scope = scope or "mcp:read mcp:write"
 
@@ -169,7 +180,9 @@ async def authorize_post(
     code_challenge_method: str = Form(...),
 ):
     if action == "deny":
-        return RedirectResponse(f"{redirect_uri}?{urlencode({'error':'access_denied','state':state})}")
+        return RedirectResponse(
+            f"{redirect_uri}?{urlencode({'error': 'access_denied', 'state': state})}"
+        )
     return await _approve(request, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method)
 
 
@@ -212,31 +225,34 @@ async def token(
     refresh_token: Optional[str] = Form(None),
     client_id: Optional[str] = Form(None),
     client_secret: Optional[str] = Form(None),
-) -> JSONResponse:
+):
     cfg = get_config()
     if not cfg.oauth.enabled or not cfg.oauth.enable_authorization_server:
-        raise HTTPException(status_code=501, detail="OAuth AS not enabled")
+        return oauth_error_response("server_error", "OAuth AS not enabled")
 
     if grant_type == "authorization_code":
         return await _auth_code_grant(code, redirect_uri, code_verifier, client_id, cfg)
     if grant_type == "refresh_token":
         return await _refresh_grant(refresh_token, client_id, cfg)
-    raise HTTPException(status_code=400, detail="Unsupported grant_type")
+    return oauth_error_response("unsupported_grant_type", f"grant_type {grant_type!r} is not supported")
 
 
-async def _auth_code_grant(code, redirect_uri, code_verifier, client_id, cfg) -> JSONResponse:
+async def _auth_code_grant(code, redirect_uri, code_verifier, client_id, cfg):
     if not code or not redirect_uri or not code_verifier:
-        raise HTTPException(status_code=400, detail="Missing required parameters")
+        return oauth_error_response(
+            "invalid_request",
+            "authorization_code grant requires code, redirect_uri, code_verifier",
+        )
     code_store = get_authorization_code_store()
     code_data = code_store.get(code)
     if not code_data or not code_data.is_valid():
-        raise HTTPException(status_code=400, detail="Invalid or expired authorization code")
+        return oauth_error_response("invalid_grant", "Invalid or expired authorization code")
     if code_data.redirect_uri != redirect_uri:
-        raise HTTPException(status_code=400, detail="Redirect URI mismatch")
+        return oauth_error_response("invalid_grant", "Redirect URI mismatch")
     if not is_valid_code_verifier(code_verifier):
-        raise HTTPException(status_code=400, detail="Invalid code_verifier format")
+        return oauth_error_response("invalid_grant", "Invalid code_verifier format")
     if not verify_code_challenge(code_verifier, code_data.code_challenge, code_data.code_challenge_method):
-        raise HTTPException(status_code=400, detail="PKCE verification failed")
+        return oauth_error_response("invalid_grant", "PKCE verification failed")
     code_store.mark_used(code)
     td = get_token_store().create_access_token(
         client_id=code_data.client_id, scope=code_data.scope,
@@ -249,12 +265,12 @@ async def _auth_code_grant(code, redirect_uri, code_verifier, client_id, cfg) ->
     ).model_dump())
 
 
-async def _refresh_grant(refresh_token, client_id, cfg) -> JSONResponse:
+async def _refresh_grant(refresh_token, client_id, cfg):
     if not refresh_token:
-        raise HTTPException(status_code=400, detail="Missing refresh_token")
+        return oauth_error_response("invalid_request", "refresh_token is required")
     rd = get_token_store().get_refresh_token(refresh_token)
     if not rd:
-        raise HTTPException(status_code=400, detail="Invalid refresh token")
+        return oauth_error_response("invalid_grant", "Invalid or expired refresh token")
     td = get_token_store().create_access_token(
         client_id=rd.client_id, scope=rd.scope,
         ttl=cfg.oauth.access_token_ttl, create_refresh_token=False,

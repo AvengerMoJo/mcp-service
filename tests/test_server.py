@@ -13,6 +13,128 @@ async def test_health_endpoint(client):
 
 
 @pytest.mark.asyncio
+async def test_healthz_endpoint(client):
+    r = await client.get("/healthz")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["server"] == "test-server"
+    assert "checks" in body
+    assert body["checks"]["server"] == "ok"
+    assert body["checks"]["token_store"]["status"] == "ok"
+    assert body["checks"]["client_store"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_healthz_oauth_disabled(handler, tmp_oauth_dir, monkeypatch):
+    monkeypatch.setenv("OAUTH_ENABLED", "false")
+    import mcp_service.config as config_mod
+    config_mod._config = None
+    from mcp_service import create_app
+    import httpx
+
+    app = create_app(handler, title="test-server")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        r = await c.get("/healthz")
+        assert r.status_code == 200
+        body = r.json()
+        assert body["checks"]["oauth"] == {"status": "disabled"}
+        # No token store checks when OAuth is off.
+        assert "token_store" not in body["checks"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_requires_auth_returns_oauth_envelope(handler, tmp_oauth_dir, monkeypatch):
+    monkeypatch.setenv("MCP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MCP_API_KEY", "")
+    import mcp_service.config as config_mod
+    import mcp_service.oauth.storage as storage_mod
+    import mcp_service.oauth.middleware as mw
+    config_mod._config = None
+    storage_mod._code_store = None
+    storage_mod._token_store = None
+    storage_mod._client_store = None
+    mw._validator = None
+    from mcp_service import create_app
+    import httpx
+
+    app = create_app(handler, title="test-server")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        r = await c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert r.status_code == 401
+        body = r.json()
+        assert body["error"] == "invalid_token"
+        assert "WWW-Authenticate" in r.headers
+
+
+@pytest.mark.asyncio
+async def test_oauth_token_error_returns_oauth_envelope(handler, tmp_oauth_dir, monkeypatch):
+    monkeypatch.setenv("MCP_REQUIRE_AUTH", "false")
+    monkeypatch.setenv("OAUTH_ENABLED", "false")
+    import mcp_service.config as config_mod
+    import mcp_service.oauth.storage as storage_mod
+    import mcp_service.oauth.middleware as mw
+    config_mod._config = None
+    storage_mod._code_store = None
+    storage_mod._token_store = None
+    storage_mod._client_store = None
+    mw._validator = None
+    from mcp_service import create_app
+    import httpx
+
+    app = create_app(handler, title="test-server")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        r = await c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            headers={"Authorization": "Bearer not-a-real-token"},
+        )
+        # OAuth disabled → invalid_token with the oauth_disabled reason.
+        assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_register_returns_oauth_error_envelope(client):
+    r = await client.post(
+        "/oauth/register",
+        json={"client_name": "x"},
+    )
+    assert r.status_code == 400
+    body = r.json()
+    assert body["error"] == "invalid_request"
+    assert "redirect_uris" in body["error_description"]
+
+
+@pytest.mark.asyncio
+async def test_token_invalid_grant_envelope(client):
+    r = await client.post(
+        "/oauth/token",
+        data={
+            "grant_type": "authorization_code",
+            "code": "fake-code",
+            "redirect_uri": "http://x/cb",
+            "code_verifier": "a" * 64,
+        },
+    )
+    assert r.status_code == 400
+    body = r.json()
+    assert body["error"] == "invalid_grant"
+
+
+@pytest.mark.asyncio
+async def test_token_unsupported_grant_type_envelope(client):
+    r = await client.post("/oauth/token", data={"grant_type": "password"})
+    assert r.status_code == 400
+    assert r.json()["error"] == "unsupported_grant_type"
+
+
+@pytest.mark.asyncio
 async def test_mcp_initialize(client):
     r = await client.post(
         "/mcp",
