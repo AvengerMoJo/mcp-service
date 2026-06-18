@@ -11,6 +11,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`MCPHandler` extensibility API** — new `mcp_service.handler.MCPHandler`
+  base class with `@register_tool` / `@register_method` decorators,
+  `on_<method>` dispatch convention, and built-in answers for
+  `initialize`, `notifications/initialized`, `ping`, `tools/list`, and
+  `tools/call`. Plain function handlers remain fully backward-compatible
+  via the `as_handler()` adapter.
+- **Lifecycle hooks** — `async def setup()` / `async def teardown()` on
+  handlers are wired into FastAPI's lifespan, so projects can open
+  database connections, warm caches, and release resources cleanly.
+- **`/.well-known/mcp.json`** — service discovery endpoint exposing the
+  protocol version, server identity, transport, supported auth schemes
+  (with `required` flags), `scopes_supported`, declared capabilities,
+  and the full tool list. Documented in the OpenAPI `discovery` tag and
+  the `/docs` UI.
+- **`request["_meta"]["user_id"]`** — the authenticated subject (from a
+  validated Bearer token) is now exposed to handlers via the request
+  payload's `_meta` block, so `MCPHandler` subclasses can implement
+  per-user authorization without threading context through every call.
+- **`example/main.py`** rewritten as a `MCPHandler` subclass demonstrating
+  tool registration, custom JSON-RPC methods, and discovery metadata.
+- **Tests** — 39 new cases (`tests/test_handler.py`) covering handler
+  registration, dispatch, built-ins, tools/call paths, discovery
+  document shape, and lifespan lifecycle. Total: **176 passing**.
+
 ## [0.1.0] — 2026-06-18
 
 The first public release of `mcp-service`. The codebase was already feature-complete

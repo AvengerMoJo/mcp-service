@@ -16,6 +16,9 @@
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+  - [Class-based handlers (MCPHandler)](#class-based-handlers-mcphandler)
+  - [Function handlers](#function-handlers)
+  - [Service discovery](#service-discovery)
 - [OAuth 2.1 Flow](#oauth-21-flow)
 - [Docker](#docker)
 - [API Reference](#api-reference)
@@ -234,10 +237,72 @@ def handler(request):
 
 ## Usage
 
-### Programmatic API
+### Class-based handlers (`MCPHandler`)
+
+For new projects, subclass `MCPHandler` to get method-based dispatch,
+tool registration, lifecycle hooks, and discovery metadata — without any
+boilerplate:
 
 ```python
-from mcp_service import create_app, run
+from mcp_service import MCPHandler, run
+
+
+class WeatherHandler(MCPHandler):
+    name = "weather-mcp"
+    version = "1.0.0"
+    description = "Read-only weather lookup"
+    protocol_version = "2024-11-05"
+
+    @MCPHandler.register_tool(
+        name="get_weather",
+        description="Get current weather for a city",
+        input_schema={
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    )
+    def get_weather(self, args: dict) -> dict:
+        return {"content": [{"type": "text",
+                             "text": f"Sunny in {args['city']}"}]}
+
+    async def on_resources_list(self, request):
+        return self._ok(request, {"resources": []})
+
+    async def setup(self):
+        # Open DB connections, warm caches, etc. Runs once at startup.
+        ...
+
+    async def teardown(self):
+        # Release resources on shutdown.
+        ...
+
+
+if __name__ == "__main__":
+    run(WeatherHandler())
+```
+
+**What you get for free:**
+
+| Built-in JSON-RPC method | Answer |
+|--------------------------|--------|
+| `initialize` | Reports `name`, `version`, `protocolVersion`, and `capabilities` |
+| `notifications/initialized` | Returns `None` → HTTP `204` |
+| `ping` | Empty result |
+| `tools/list` | Iterates over registered tools |
+| `tools/call` | Invokes the matching callable; wraps plain results in MCP `content` |
+| any other method | Routed via `@register_method("foo/bar")` or `on_foo_bar(self, req)` |
+
+The authenticated subject (when a Bearer token is present) is surfaced
+via `request["_meta"]["user_id"]`, so handlers can implement per-user
+authorization without threading context through every call.
+
+### Function handlers
+
+Plain function handlers remain fully supported:
+
+```python
+from mcp_service import run
 
 def my_handler(request: dict) -> dict | None:
     method = request.get("method")
@@ -245,31 +310,78 @@ def my_handler(request: dict) -> dict | None:
         return {
             "jsonrpc": "2.0",
             "id": request.get("id"),
-            "result": {"tools": [{"name": "ping", "description": "Returns pong"}]},
+            "result": {"tools": [
+                {"name": "ping", "description": "Returns pong"},
+            ]},
         }
     if method == "tools/call":
-        # dispatch tool calls here
-        ...
+        return {"jsonrpc": "2.0", "id": request.get("id"),
+                "result": {"content": [{"type": "text", "text": "pong"}]}}
     return None
 
-# ASGI app (for mounting under an existing ASGI server)
-app = create_app(my_handler, title="My Server")
-
-# Blocking uvicorn entry point
-run(my_handler, host="0.0.0.0", port=8000, title="My Server")
+if __name__ == "__main__":
+    run(my_handler, title="My Server")
 ```
+
+Internally, `create_app` wraps function handlers in a lightweight
+`MCPHandler` adapter so the dispatch path is identical for both styles.
 
 ### Handler contract
 
 ```python
-Handler = Callable[[dict], Optional[dict]]
+Handler = MCPHandler | Callable[[dict], Optional[dict]]
 ```
 
-- **Input:** a raw JSON-RPC 2.0 request dict (`jsonrpc`, `id`, `method`, `params`).
+- **Input:** a raw JSON-RPC 2.0 request dict (`jsonrpc`, `id`, `method`,
+  `params`, plus `_meta` for context like `user_id`).
 - **Output:**
   - a dict — wrapped in a 200 response.
   - `None` — notification; responded with `204 No Content`.
   - raise an exception — wrapped in a 500 JSON-RPC error.
+
+### Service discovery
+
+Every server advertises its capabilities at a stable well-known URI.
+Clients fetch this **once on connect** to learn what's supported before
+negotiating OAuth or sending method calls:
+
+```bash
+curl http://localhost:8000/.well-known/mcp.json
+```
+
+```json
+{
+  "mcp_version": "2024-11-05",
+  "server": {"name": "weather-mcp", "version": "1.0.0", "description": "Read-only weather lookup"},
+  "transport": {"type": "http", "endpoint": "/mcp", "methods": ["POST", "GET"]},
+  "auth": {
+    "required": false,
+    "schemes": [
+      {"type": "bearer", "header": "Authorization", "required": false},
+      {"type": "api-key", "header": "MCP-API-Key", "required": false}
+    ],
+    "authorization_server": "http://localhost:8000/.well-known/oauth-authorization-server",
+    "registration_endpoint": "http://localhost:8000/oauth/register"
+  },
+  "scopes_supported": ["mcp:read", "mcp:write", "mcp:admin"],
+  "capabilities": {"tools": {"listChanged": false}},
+  "tools": [
+    {"name": "get_weather", "description": "Get current weather for a city",
+     "inputSchema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}
+  ],
+  "endpoints": {
+    "mcp": "/mcp",
+    "openapi": "/openapi.json",
+    "docs": "/docs",
+    "health": "/health",
+    "healthz": "/healthz"
+  }
+}
+```
+
+`capabilities` and `tools` are populated automatically from
+`MCPHandler.capabilities()` and `MCPHandler.list_tools()`. Override
+those on a subclass to customise.
 
 ### CLI entry point
 
