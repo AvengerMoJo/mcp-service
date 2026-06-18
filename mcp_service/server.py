@@ -18,13 +18,14 @@ for notifications). All OAuth/auth plumbing is handled by the server.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
-import time
-from typing import Callable, Optional
+from contextlib import asynccontextmanager
+from typing import Callable, Optional, Union
 
-from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
@@ -42,6 +43,7 @@ from mcp_service.errors import (
     jsonrpc_error,
     oauth_error_response,
 )
+from mcp_service.handler import MCPHandler, as_handler
 from mcp_service.oauth.middleware import ValidatedOAuthToken, RequiredOAuthToken
 from mcp_service.oauth import endpoints as oauth_endpoints
 from mcp_service.oauth.storage import (
@@ -51,25 +53,55 @@ from mcp_service.oauth.storage import (
 
 __version__ = "0.1.0"
 
-Handler = Callable[[dict], Optional[dict]]
+Handler = Union[MCPHandler, Callable[[dict], Optional[dict]]]
 
 _log = logging.getLogger(__name__)
 
 
-def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
+def create_app(handler: Handler, title: str = "MCP Service",
+               description: str = "") -> FastAPI:
     """
     Create a FastAPI application wrapping *handler*.
 
-    handler(request: dict) -> dict | None
-        Receives a raw JSON-RPC 2.0 request dict.
-        Returns a response dict, or None for notifications (204).
+    ``handler`` may be:
+      * a plain ``Callable[[dict], Optional[dict]]`` — backward compatible;
+      * an :class:`MCPHandler` subclass — recommended for new code; gives
+        method-based dispatch, tool registration, lifecycle hooks, and
+        discovery metadata.
     """
     cfg = get_config()
+    handler_obj = as_handler(handler)
+    # Use the handler's own metadata when present so /docs, OpenAPI and
+    # /.well-known/mcp.json all reflect the same identity.
+    title = handler_obj.name if handler_obj.name != "mcp-service" else title
+    description = handler_obj.description or description
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """Run handler.setup() on startup, handler.teardown() on shutdown."""
+        setup = handler_obj.setup
+        teardown = handler_obj.teardown
+        try:
+            res = setup()
+            if inspect.isawaitable(res):
+                await res
+        except Exception:
+            _log.exception("handler.setup() failed")
+            raise
+        try:
+            yield
+        finally:
+            try:
+                res = teardown()
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:
+                _log.exception("handler.teardown() failed")
 
     app = FastAPI(
         title=title,
         version=__version__,
-        description=(
+        description=description or (
             "Model Context Protocol HTTP server with built-in OAuth 2.1 "
             "Authorization Server (RFC 8414, 7636, 7591, 6749). "
             "Mount this under any ASGI server, or call `run()` to start the "
@@ -80,15 +112,17 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
             "  -H 'Content-Type: application/json' \\\n"
             "  -d '{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}'\n"
             "```\n\n"
-            "**OAuth flow:** see [ERRORS.md](https://github.com/AvengerMoJo/mcp-service/blob/main/docs/ERRORS.md) "
-            "for the full error catalog."
+            "**Discovery:** see [`/.well-known/mcp.json`](.well-known/mcp.json) "
+            "for runtime capability metadata."
         ),
+        lifespan=lifespan,
         contact={"name": "AvengerMoJo", "url": "https://github.com/AvengerMoJo/mcp-service"},
         license_info={"name": "MIT", "url": "https://opensource.org/licenses/MIT"},
         openapi_tags=[
             {"name": "mcp", "description": "JSON-RPC 2.0 endpoints — POST MCP requests here."},
             {"name": "oauth", "description": "OAuth 2.1 Authorization Server endpoints."},
             {"name": "health", "description": "Liveness / readiness probes."},
+            {"name": "discovery", "description": "Service discovery and metadata endpoints."},
         ],
         swagger_ui_init_oauth={
             "clientId": "swagger-ui-preview-client",
@@ -102,6 +136,7 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
     # Carry the version through to the OpenAPI schema so external API clients
     # see exactly which version they are talking to.
     app.openapi_version = "3.1.0"
+    app.state.handler = handler_obj
 
     # Trust X-Forwarded-Proto/Host from Cloudflare or any reverse proxy
     app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
@@ -233,7 +268,7 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
     )
     async def mcp_oauth(raw: Request, token: RequiredOAuthToken):
         """MCP endpoint requiring a valid OAuth bearer token."""
-        return await _dispatch(raw, handler, token.user_id)
+        return await _dispatch(raw, handler_obj, token.user_id)
 
     # ── Main MCP endpoint (/) — auth optional or enforced by MCP_REQUIRE_AUTH ─
 
@@ -303,7 +338,7 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
                     audience=cfg.oauth.audience or "mcp_service",
                 )
         user_id = token.user_id if token else None
-        return await _dispatch(raw, handler, user_id)
+        return await _dispatch(raw, handler_obj, user_id)
 
     # ── SSE GET (keep-alive for MCP spec) ─────────────────────────────────────
 
@@ -328,6 +363,83 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
         """Minimal SSE endpoint — tells clients this server uses HTTP transport."""
         return JSONResponse({"transport": "http", "note": "POST to this endpoint"})
 
+    # ── Service discovery ─────────────────────────────────────────────────────
+
+    @app.get(
+        "/.well-known/mcp.json",
+        summary="MCP service discovery document",
+        description=(
+            "Returns the runtime capabilities of this MCP server — protocol "
+            "version, server identity, transport, auth schemes, scopes, and "
+            "(when the handler exposes them) the list of available tools and "
+            "capabilities. Clients should fetch this on connect to discover "
+            "what the server can do before negotiating."
+        ),
+        tags=["discovery"],
+        responses={
+            200: {
+                "description": "Service discovery document",
+                "content": {"application/json": {"example": {
+                    "mcp_version": "2024-11-05",
+                    "server": {"name": "example-mcp-server", "version": "0.1.0"},
+                    "transport": {"type": "http", "endpoint": "/mcp"},
+                    "auth": {"required": False, "schemes": []},
+                    "scopes_supported": ["mcp:read", "mcp:write", "mcp:admin"],
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "tools": [],
+                }}},
+            },
+        },
+    )
+    async def mcp_discovery(request: Request):
+        """Service discovery document — see ``handler.discovery_metadata()``."""
+        base = f"{request.url.scheme}://{request.url.netloc}"
+
+        schemes: list[dict] = []
+        required = cfg.require_auth
+        schemes.append({"type": "bearer", "header": "Authorization",
+                        "required": required})
+        if cfg.api_key:
+            schemes.append({"type": "api-key", "header": "MCP-API-Key",
+                            "required": required})
+
+        auth_block: dict = {"required": cfg.require_auth, "schemes": schemes}
+        if cfg.oauth.enabled and cfg.oauth.enable_authorization_server:
+            auth_block["authorization_server"] = (
+                f"{base}/.well-known/oauth-authorization-server"
+            )
+            auth_block["registration_endpoint"] = f"{base}/oauth/register"
+
+        meta = handler_obj.discovery_metadata()
+        server_block = {
+            "name": meta["name"],
+            "version": meta["version"],
+        }
+        if meta.get("description"):
+            server_block["description"] = meta["description"]
+
+        return {
+            "mcp_version": meta["protocol_version"],
+            "server": server_block,
+            "transport": {"type": "http", "endpoint": "/mcp",
+                          "methods": ["POST", "GET"]},
+            "auth": auth_block,
+            "scopes_supported": cfg.oauth.supported_scopes,
+            "capabilities": meta["capabilities"],
+            "tools": meta["tools"],
+            "endpoints": {
+                "mcp": "/mcp",
+                "mcp_oauth_required": "/oauth",
+                "openapi": "/openapi.json",
+                "docs": "/docs",
+                "health": "/health",
+                "healthz": "/healthz",
+                "oauth_authorization_server": (
+                    "/.well-known/oauth-authorization-server"
+                ),
+            },
+        }
+
     return app
 
 
@@ -339,7 +451,7 @@ def _json_response(data: dict, status_code: int = 200) -> JSONResponse:
                     media_type="application/json; charset=utf-8")
 
 
-async def _dispatch(raw: Request, handler: Handler, user_id: Optional[str]) -> JSONResponse:
+async def _dispatch(raw: Request, handler: MCPHandler, user_id: Optional[str]) -> JSONResponse:
     try:
         body = await raw.json()
     except Exception:
@@ -351,8 +463,14 @@ async def _dispatch(raw: Request, handler: Handler, user_id: Optional[str]) -> J
         return _json_response(jsonrpc_envelope(req_id, error=jsonrpc_error(
             JSONRPC_INVALID_REQUEST, "Invalid Request")), 400)
 
+    # Surface the authenticated subject to the handler. The handler can read
+    # these via the request dict without us threading a context object
+    # through every call site.
+    if user_id is not None:
+        body.setdefault("_meta", {})["user_id"] = user_id
+
     try:
-        resp = handler(body)
+        resp = await handler.handle(body)
     except Exception as e:
         _log.exception("handler error")
         return _json_response(jsonrpc_envelope(body.get("id"), error=jsonrpc_error(
