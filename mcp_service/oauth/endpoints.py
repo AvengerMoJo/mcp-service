@@ -8,13 +8,14 @@ OAuth 2.1 Authorization Server endpoints.
   POST /oauth/token                             — exchange code → tokens, refresh
 """
 
+import json
 import logging
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode, urlparse
 
 from fastapi import APIRouter, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from .models import AuthorizationServerMetadata, TokenResponse
@@ -29,6 +30,12 @@ from mcp_service.config import get_config
 _log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["oauth"])
+
+
+def _json(data: dict, status_code: int = 200) -> Response:
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return Response(content=body, status_code=status_code,
+                    media_type="application/json; charset=utf-8")
 
 _template_dir = Path(__file__).parent / "templates"
 _template_dir.mkdir(exist_ok=True)
@@ -50,7 +57,7 @@ def _validate_redirect_uri(uri: str) -> bool:
 # ── discovery ─────────────────────────────────────────────────────────────────
 
 @router.get("/.well-known/oauth-authorization-server")
-async def as_metadata(request: Request) -> JSONResponse:
+async def as_metadata(request: Request) -> Response:
     cfg = get_config()
     if not cfg.oauth.enabled or not cfg.oauth.enable_authorization_server:
         raise HTTPException(status_code=501, detail="OAuth AS not enabled")
@@ -62,22 +69,22 @@ async def as_metadata(request: Request) -> JSONResponse:
         registration_endpoint=f"{base}/oauth/register",
         scopes_supported=cfg.oauth.supported_scopes,
     )
-    return JSONResponse(content=meta.model_dump())
+    return _json(meta.model_dump())
 
 
 @router.get("/.well-known/oauth-protected-resource")
-async def protected_resource_metadata(request: Request) -> JSONResponse:
+async def protected_resource_metadata(request: Request) -> Response:
     cfg = get_config()
     if not cfg.oauth.enabled:
         raise HTTPException(status_code=501, detail="OAuth not enabled")
     base = _base_url(request)
-    return JSONResponse(content=cfg.oauth.get_protected_resource_metadata(base))
+    return _json(cfg.oauth.get_protected_resource_metadata(base))
 
 
 # ── Dynamic Client Registration ───────────────────────────────────────────────
 
 @router.post("/oauth/register")
-async def register_client(request: Request) -> JSONResponse:
+async def register_client(request: Request) -> Response:
     cfg = get_config()
     if not cfg.oauth.enabled or not cfg.oauth.enable_authorization_server:
         raise HTTPException(status_code=501, detail="OAuth AS not enabled")
@@ -98,8 +105,7 @@ async def register_client(request: Request) -> JSONResponse:
         response_types=body.get("response_types", ["code"]),
         scope=body.get("scope", " ".join(cfg.oauth.supported_scopes)),
     )
-    import time as _t
-    return JSONResponse(content={
+    return _json({
         "client_id": client.client_id,
         "client_id_issued_at": int(client.created_at.timestamp()),
         "client_name": client.client_name,
@@ -236,7 +242,7 @@ async def _auth_code_grant(code, redirect_uri, code_verifier, client_id, cfg) ->
         client_id=code_data.client_id, scope=code_data.scope,
         ttl=cfg.oauth.access_token_ttl, refresh_token_ttl=cfg.oauth.refresh_token_ttl,
     )
-    return JSONResponse(content=TokenResponse(
+    return _json(TokenResponse(
         access_token=td.token, token_type="Bearer",
         expires_in=td.get_expires_in(), refresh_token=td.refresh_token,
         scope=code_data.scope,
@@ -253,7 +259,7 @@ async def _refresh_grant(refresh_token, client_id, cfg) -> JSONResponse:
         client_id=rd.client_id, scope=rd.scope,
         ttl=cfg.oauth.access_token_ttl, create_refresh_token=False,
     )
-    return JSONResponse(content=TokenResponse(
+    return _json(TokenResponse(
         access_token=td.token, token_type="Bearer",
         expires_in=td.get_expires_in(), refresh_token=refresh_token,
         scope=rd.scope,

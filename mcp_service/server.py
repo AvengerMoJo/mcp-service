@@ -27,6 +27,7 @@ from typing import Callable, Optional
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from mcp_service.config import get_config
 from mcp_service.oauth.middleware import ValidatedOAuthToken, RequiredOAuthToken
@@ -49,6 +50,9 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
 
     app = FastAPI(title=title, version="0.1.0",
                   description="MCP HTTP server with OAuth 2.1")
+
+    # Trust X-Forwarded-Proto/Host from Cloudflare or any reverse proxy
+    app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
     # CORS — allow all origins so claude.ai and Claude Code can connect
     app.add_middleware(
@@ -110,27 +114,36 @@ def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
     return app
 
 
+def _json_response(data: dict, status_code: int = 200) -> JSONResponse:
+    """JSONResponse with explicit UTF-8 encoding to avoid Content-Length mismatch."""
+    from starlette.responses import Response
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+    return Response(content=body, status_code=status_code,
+                    media_type="application/json; charset=utf-8")
+
+
 async def _dispatch(raw: Request, handler: Handler, user_id: Optional[str]) -> JSONResponse:
     try:
         body = await raw.json()
     except Exception:
-        return JSONResponse({"jsonrpc": "2.0", "id": None,
-                             "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
+        return _json_response({"jsonrpc": "2.0", "id": None,
+                               "error": {"code": -32700, "message": "Parse error"}}, 400)
 
     if not isinstance(body, dict) or body.get("jsonrpc") != "2.0" or "method" not in body:
-        return JSONResponse({"jsonrpc": "2.0", "id": body.get("id") if isinstance(body, dict) else None,
-                             "error": {"code": -32600, "message": "Invalid Request"}}, status_code=400)
+        return _json_response({"jsonrpc": "2.0", "id": body.get("id") if isinstance(body, dict) else None,
+                               "error": {"code": -32600, "message": "Invalid Request"}}, 400)
 
     try:
         resp = handler(body)
     except Exception as e:
         _log.exception("handler error")
-        return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"),
-                             "error": {"code": -32603, "message": str(e)}}, status_code=500)
+        return _json_response({"jsonrpc": "2.0", "id": body.get("id"),
+                               "error": {"code": -32603, "message": str(e)}}, 500)
 
     if resp is None:
-        return JSONResponse(content={}, status_code=204)
-    return JSONResponse(content=resp)
+        from starlette.responses import Response
+        return Response(status_code=204)
+    return _json_response(resp)
 
 
 def run(handler: Handler, host: str = "0.0.0.0", port: Optional[int] = None,
