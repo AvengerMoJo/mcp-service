@@ -1,0 +1,157 @@
+"""
+MCP Service — FastAPI server factory.
+
+Usage:
+    from mcp_service.server import create_app, run
+
+    def my_handler(request: dict) -> dict | None:
+        # your JSON-RPC logic here
+        ...
+
+    app = create_app(my_handler)          # for ASGI mounting
+    run(my_handler)                       # blocking uvicorn entry point
+    run(my_handler, port=5300)            # custom port
+
+The handler receives a raw JSON-RPC dict and returns a response dict (or None
+for notifications). All OAuth/auth plumbing is handled by the server.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import time
+from typing import Callable, Optional
+
+from fastapi import FastAPI, Header, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from mcp_service.config import get_config
+from mcp_service.oauth.middleware import ValidatedOAuthToken, RequiredOAuthToken
+from mcp_service.oauth import endpoints as oauth_endpoints
+
+Handler = Callable[[dict], Optional[dict]]
+
+_log = logging.getLogger(__name__)
+
+
+def create_app(handler: Handler, title: str = "MCP Service") -> FastAPI:
+    """
+    Create a FastAPI application wrapping *handler*.
+
+    handler(request: dict) -> dict | None
+        Receives a raw JSON-RPC 2.0 request dict.
+        Returns a response dict, or None for notifications (204).
+    """
+    cfg = get_config()
+
+    app = FastAPI(title=title, version="0.1.0",
+                  description="MCP HTTP server with OAuth 2.1")
+
+    # CORS — allow all origins so claude.ai and Claude Code can connect
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*", "Authorization", "mcp-session-id"],
+    )
+
+    # Mount OAuth AS endpoints (well-known + /oauth/*)
+    if cfg.oauth.enabled and cfg.oauth.enable_authorization_server:
+        app.include_router(oauth_endpoints.router)
+        _log.info("OAuth 2.1 AS endpoints mounted")
+
+    # ── health ────────────────────────────────────────────────────────────────
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "server": title}
+
+    # ── OAuth-gated endpoint (/oauth POST) ────────────────────────────────────
+
+    @app.post("/oauth")
+    async def mcp_oauth(raw: Request, token: RequiredOAuthToken):
+        """MCP endpoint requiring a valid OAuth bearer token."""
+        return await _dispatch(raw, handler, token.user_id)
+
+    # ── Main MCP endpoint (/) — auth optional or enforced by MCP_REQUIRE_AUTH ─
+
+    @app.post("/mcp")
+    @app.post("/")
+    async def mcp_main(
+        raw: Request,
+        token: ValidatedOAuthToken = None,
+        mcp_api_key: Optional[str] = Header(None, alias="MCP-API-Key"),
+        authorization: Optional[str] = Header(None),
+    ):
+        if cfg.require_auth:
+            has_oauth = token is not None
+            has_key = mcp_api_key and mcp_api_key == cfg.api_key
+            if not has_oauth and not has_key:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Authentication required: Bearer token or MCP-API-Key",
+                    headers={"WWW-Authenticate": 'Bearer realm="MCP Server"'},
+                )
+        user_id = token.user_id if token else None
+        return await _dispatch(raw, handler, user_id)
+
+    # ── SSE GET (keep-alive for MCP spec) ─────────────────────────────────────
+
+    @app.get("/mcp")
+    @app.get("/")
+    async def mcp_sse_info():
+        """Minimal SSE endpoint — tells clients this server uses HTTP transport."""
+        return JSONResponse({"transport": "http", "note": "POST to this endpoint"})
+
+    return app
+
+
+async def _dispatch(raw: Request, handler: Handler, user_id: Optional[str]) -> JSONResponse:
+    try:
+        body = await raw.json()
+    except Exception:
+        return JSONResponse({"jsonrpc": "2.0", "id": None,
+                             "error": {"code": -32700, "message": "Parse error"}}, status_code=400)
+
+    if not isinstance(body, dict) or body.get("jsonrpc") != "2.0" or "method" not in body:
+        return JSONResponse({"jsonrpc": "2.0", "id": body.get("id") if isinstance(body, dict) else None,
+                             "error": {"code": -32600, "message": "Invalid Request"}}, status_code=400)
+
+    try:
+        resp = handler(body)
+    except Exception as e:
+        _log.exception("handler error")
+        return JSONResponse({"jsonrpc": "2.0", "id": body.get("id"),
+                             "error": {"code": -32603, "message": str(e)}}, status_code=500)
+
+    if resp is None:
+        return JSONResponse(content={}, status_code=204)
+    return JSONResponse(content=resp)
+
+
+def run(handler: Handler, host: str = "0.0.0.0", port: Optional[int] = None,
+        title: str = "MCP Service") -> None:
+    """Start the uvicorn server (blocking)."""
+    import uvicorn
+    cfg = get_config()
+    p = port or cfg.port
+    app = create_app(handler, title=title)
+    _log.info("Starting %s on %s:%s", title, host, p)
+    uvicorn.run(app, host=host, port=p, log_level="info")
+
+
+def main() -> None:
+    """CLI entry point — requires MCP_HANDLER env var pointing to a dotted import path."""
+    import importlib
+    handler_path = os.getenv("MCP_HANDLER")
+    if not handler_path:
+        print("Set MCP_HANDLER=module.path:function_name")
+        raise SystemExit(1)
+    module_path, _, fn_name = handler_path.partition(":")
+    module = importlib.import_module(module_path)
+    handler = getattr(module, fn_name)
+    run(handler)
