@@ -155,7 +155,7 @@ All configuration is via environment variables. Copy `.env.example` to `.env` an
 | `OAUTH_ACCESS_TOKEN_TTL` | int | `3600` | Access token lifetime in seconds (1 hour). |
 | `OAUTH_REFRESH_TOKEN_TTL` | int | `2592000` | Refresh token lifetime (30 days). |
 | `OAUTH_AUTH_CODE_TTL` | int | `600` | Authorization code lifetime (10 minutes). |
-| `OAUTH_SUPPORTED_SCOPES` | space-separated string | `mcp:read mcp:write mcp:admin` | Allowed OAuth scopes. Custom scopes can be added here. |
+| `OAUTH_SUPPORTED_SCOPES` | space-separated string | `mcp:read mcp:write mcp:admin` | Allowed OAuth scopes. See [Custom scopes](#custom-oauth-scopes) below. |
 | `OAUTH_ISSUER` | URL | _empty_ | Expected `iss` claim for JWT validation. |
 | `OAUTH_AUDIENCE` | string | _empty_ | Expected `aud` claim for JWT validation. |
 | `OAUTH_JWKS_URI` | URL | _empty_ | JWKS endpoint for external IdP signature verification. |
@@ -198,6 +198,36 @@ OAUTH_AUDIENCE=https://mcp.yourcompany.com
 OAUTH_JWKS_URI=https://your-tenant.auth0.com/.well-known/jwks.json
 OAUTH_VERIFY_AUDIENCE=true
 OAUTH_VERIFY_ISSUER=true
+```
+
+### Custom OAuth Scopes
+
+`OAUTH_SUPPORTED_SCOPES` accepts any whitespace-separated list of scope names.
+The AS treats them as **opaque strings** — `mcp-service` does not enforce a
+fixed taxonomy. Projects can use domain-specific names and decide for
+themselves how to interpret them in their handler.
+
+```env
+# Custom scope set for a finance MCP server
+OAUTH_SUPPORTED_SCOPES=portfolio:read portfolio:write trades:execute admin
+```
+
+The scopes appear in:
+
+- `/.well-known/oauth-authorization-server` → `scopes_supported`
+- `/.well-known/oauth-protected-resource` → `scopes_supported`
+- The consent page template (each scope rendered as a list item)
+- The `scope` claim of issued access tokens
+
+The handler receives the granted scopes in the validated `OAuthToken.scopes`
+list, so the application code can enforce them however it wants:
+
+```python
+def handler(request):
+    if request.get("method") == "tools/call":
+        tool = request["params"]["name"]
+        if tool == "execute_trade" and "trades:execute" not in request["scopes"]:
+            return error(-32603, "missing required scope: trades:execute")
 ```
 
 ---
