@@ -59,5 +59,10 @@ class ExampleHandler(MCPHandler):
         return self._ok(request, {"user_id": user_id})
 
 
+# Module-level handler instance — ``MCP_HANDLER=example.main:handler`` picks
+# this up out of the box, so ``docker run mcp-service`` is a usable smoke test.
+handler = ExampleHandler()
+
+
 if __name__ == "__main__":
     run(ExampleHandler(), title="Example MCP Server")
