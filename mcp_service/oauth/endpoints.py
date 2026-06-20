@@ -156,16 +156,19 @@ async def authorize_get(
     if cfg.oauth.auto_approve:
         return await _approve(request, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method)
 
-    return templates.TemplateResponse("authorize.html", {
-        "request": request,
-        "client_id": client_id or "MCP Client",
-        "redirect_uri": redirect_uri,
-        "scope": scope,
-        "scopes": scope.split(),
-        "state": state,
-        "code_challenge": code_challenge,
-        "code_challenge_method": code_challenge_method,
-    })
+    return templates.TemplateResponse(
+        request,
+        "authorize.html",
+        {
+            "client_id": client_id or "MCP Client",
+            "redirect_uri": redirect_uri,
+            "scope": scope,
+            "scopes": scope.split(),
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
+        },
+    )
 
 
 @router.post("/oauth/authorize")
