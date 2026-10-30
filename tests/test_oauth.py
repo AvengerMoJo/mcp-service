@@ -44,7 +44,11 @@ class TestMetadata:
         r = await client.get("/.well-known/oauth-protected-resource")
         assert r.status_code == 200
         body = r.json()
-        assert body["resource"] == "http://testserver"
+        # RFC 9728 §2 — `resource` is the MCP endpoint, `authorization_servers`
+        # lists the AS issuer origin (not the metadata document URL).
+        assert body["resource"] == "http://testserver/mcp"
+        assert body["authorization_servers"] == ["http://testserver"]
+        assert "header" in body["bearer_methods_supported"]
         assert "mcp:read" in body["scopes_supported"]
 
 
@@ -447,6 +451,240 @@ class TestRefreshGrant:
             "/oauth/token", data={"grant_type": "refresh_token"}
         )
         assert r.status_code == 400
+
+
+class TestClientValidation:
+    """client_id / redirect_uri are checked against the DCR registration
+    (RFC 6749 §2.2, §3.1.2.2) — previously only shape-validated."""
+
+    @pytest.mark.asyncio
+    async def test_unknown_client_id_rejected(self, client):
+        v, c = generate_pkce_pair()
+        r = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": "never-registered",
+                "redirect_uri": "http://localhost:9999/cb",
+                "state": "s",
+                "code_challenge": c,
+                "code_challenge_method": "S256",
+            },
+        )
+        # invalid_client maps to 401 per the RFC 6749 §5.2 error catalog.
+        assert r.status_code == 401
+        assert r.json()["error"] == "invalid_client"
+
+    @pytest.mark.asyncio
+    async def test_missing_client_id_rejected(self, client):
+        v, c = generate_pkce_pair()
+        r = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "redirect_uri": "http://localhost:9999/cb",
+                "state": "s",
+                "code_challenge": c,
+                "code_challenge_method": "S256",
+            },
+        )
+        # client_id is REQUIRED (RFC 6749 §4.1.1) → FastAPI 422 validation.
+        assert r.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_redirect_uri_not_registered_rejected(self, client):
+        registered = await _register(client, redirect_uri="http://localhost:9999/cb")
+        v, c = generate_pkce_pair()
+        r = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": registered["client_id"],
+                "redirect_uri": "https://evil.example.com/cb",
+                "state": "s",
+                "code_challenge": c,
+                "code_challenge_method": "S256",
+            },
+        )
+        assert r.status_code == 401
+        assert "not registered" in r.json()["error_description"]
+
+    @pytest.mark.asyncio
+    async def test_secondary_registered_redirect_uri_allowed(self, client):
+        registered = await _register(
+            client, redirect_uri="http://localhost:9999/cb"
+        )
+        # Re-register isn't needed: register another client with two URIs.
+        r = await client.post(
+            "/oauth/register",
+            json={"client_name": "multi",
+                  "redirect_uris": ["http://a.example.com/cb",
+                                    "http://b.example.com/cb"]},
+        )
+        client_id = r.json()["client_id"]
+        v, c = generate_pkce_pair()
+        r = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": "http://b.example.com/cb",
+                "state": "s",
+                "code_challenge": c,
+                "code_challenge_method": "S256",
+            },
+            follow_redirects=False,
+        )
+        assert r.status_code in (302, 303, 307)
+        assert "code" in parse_qs(urlparse(r.headers["location"]).query)
+
+
+class TestResourceParam:
+    """RFC 8707 — `resource` is accepted on authorize/token and echoed."""
+
+    @pytest.mark.asyncio
+    async def test_resource_echoed_in_token_response(self, client):
+        registered = await _register(client)
+        verifier, challenge = generate_pkce_pair()
+        resource = "https://mcp.example.com/mcp"
+        auth = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": registered["client_id"],
+                "redirect_uri": "http://localhost:9999/cb",
+                "state": "s",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": resource,
+            },
+            follow_redirects=False,
+        )
+        code = parse_qs(urlparse(auth.headers["location"]).query)["code"][0]
+        r = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://localhost:9999/cb",
+                "code_verifier": verifier,
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["resource"] == resource
+
+    @pytest.mark.asyncio
+    async def test_resource_mismatch_rejected(self, client):
+        registered = await _register(client)
+        verifier, challenge = generate_pkce_pair()
+        auth = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": registered["client_id"],
+                "redirect_uri": "http://localhost:9999/cb",
+                "state": "s",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": "https://mcp.example.com/mcp",
+            },
+            follow_redirects=False,
+        )
+        code = parse_qs(urlparse(auth.headers["location"]).query)["code"][0]
+        r = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://localhost:9999/cb",
+                "code_verifier": verifier,
+                "resource": "https://other.example.com/mcp",
+            },
+        )
+        assert r.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_resource_with_fragment_rejected(self, client):
+        registered = await _register(client)
+        v, c = generate_pkce_pair()
+        r = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": registered["client_id"],
+                "redirect_uri": "http://localhost:9999/cb",
+                "state": "s",
+                "code_challenge": c,
+                "code_challenge_method": "S256",
+                "resource": "https://mcp.example.com/mcp#frag",
+            },
+        )
+        assert r.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_client_id_mismatch_at_token_rejected(self, client):
+        registered = await _register(client)
+        verifier, challenge = generate_pkce_pair()
+        auth = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": registered["client_id"],
+                "redirect_uri": "http://localhost:9999/cb",
+                "state": "s",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+            },
+            follow_redirects=False,
+        )
+        code = parse_qs(urlparse(auth.headers["location"]).query)["code"][0]
+        r = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://localhost:9999/cb",
+                "code_verifier": verifier,
+                "client_id": "someone-else",
+            },
+        )
+        assert r.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_refresh_echoes_resource(self, client):
+        registered = await _register(client)
+        verifier, challenge = generate_pkce_pair()
+        resource = "https://mcp.example.com/mcp"
+        auth = await client.get(
+            "/oauth/authorize",
+            params={
+                "response_type": "code",
+                "client_id": registered["client_id"],
+                "redirect_uri": "http://localhost:9999/cb",
+                "state": "s",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "resource": resource,
+            },
+            follow_redirects=False,
+        )
+        code = parse_qs(urlparse(auth.headers["location"]).query)["code"][0]
+        tok = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": "http://localhost:9999/cb",
+                "code_verifier": verifier,
+            },
+        )
+        r = await client.post(
+            "/oauth/token",
+            data={"grant_type": "refresh_token",
+                  "refresh_token": tok.json()["refresh_token"]},
+        )
+        assert r.status_code == 200
+        assert r.json()["resource"] == resource
 
 
 class TestOAuthDisabled:

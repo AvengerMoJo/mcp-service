@@ -11,7 +11,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **RFC 9728 protected-resource metadata fixed** — `resource` now identifies
+  the MCP endpoint (`{base}/mcp`) instead of the bare origin, and
+  `authorization_servers` lists the AS issuer origin instead of the metadata
+  document URL. Added `bearer_methods_supported: ["header"]`. This is what
+  ChatGPT/OpenAI connectors read to start the OAuth flow; the previous
+  values made discovery fail.
+- **`WWW-Authenticate` challenges now carry `resource_metadata`** (RFC 9728
+  §5.1) on every 401 — the MCP endpoint and the OAuth token validator
+  dependencies. Without this param clients cannot discover the authorization
+  server and fall back to (unsupported) static API keys.
+- **`redirect_uri` is enforced against the client's DCR registration** at the
+  authorize endpoint, and `client_id` is required and checked against
+  registered clients (RFC 6749 §2.2, §3.1.2.2; OAuth 2.1). Previously any
+  shape-valid `redirect_uri` was accepted and unknown `client_id`s were
+  allowed through — an open-redirect/mix-up risk.
+
 ### Added
+
+- **RFC 8707 `resource` parameter** — accepted at `/oauth/authorize` and
+  `/oauth/token`, bound to the authorization code and refresh token, echoed
+  in token responses, and mismatch-checked. `client_id` mismatches at the
+  token endpoint are now rejected with `invalid_grant`.
+- **`build_www_authenticate(..., resource_metadata=...)`** — new keyword
+  parameter, threaded through `oauth_error_response` and
+  `TokenValidator.create_www_authenticate_header`.
+- **Tests** — 12 new cases covering the metadata fix, challenge header,
+  client/redirect_uri validation, and `resource` echo/mismatch. Total:
+  **188 passing**.
 
 - **`MCPHandler` extensibility API** — new `mcp_service.handler.MCPHandler`
   base class with `@register_tool` / `@register_method` decorators,

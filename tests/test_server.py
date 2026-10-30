@@ -73,6 +73,41 @@ async def test_mcp_requires_auth_returns_oauth_envelope(handler, tmp_oauth_dir, 
 
 
 @pytest.mark.asyncio
+async def test_mcp_challenge_carries_resource_metadata(handler, tmp_oauth_dir, monkeypatch):
+    """RFC 9728 §5.1 — the 401 challenge must point at the protected-resource
+    metadata URL; ChatGPT/OpenAI connectors use it to discover the AS."""
+    monkeypatch.setenv("MCP_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("MCP_API_KEY", "")
+    import mcp_service.config as config_mod
+    import mcp_service.oauth.storage as storage_mod
+    import mcp_service.oauth.middleware as mw
+    config_mod._config = None
+    storage_mod._code_store = None
+    storage_mod._token_store = None
+    storage_mod._client_store = None
+    mw._validator = None
+    from mcp_service import create_app
+    import httpx
+
+    app = create_app(handler, title="test-server")
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        r = await c.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+        )
+        assert r.status_code == 401
+        www = r.headers["WWW-Authenticate"]
+        assert (
+            'resource_metadata="http://testserver/.well-known/oauth-protected-resource"'
+        ) in www
+        # And the advertised document must actually exist.
+        r2 = await c.get("/.well-known/oauth-protected-resource")
+        assert r2.status_code == 200
+        assert r2.json()["resource"] == "http://testserver/mcp"
+
+
+@pytest.mark.asyncio
 async def test_oauth_token_error_returns_oauth_envelope(handler, tmp_oauth_dir, monkeypatch):
     monkeypatch.setenv("MCP_REQUIRE_AUTH", "false")
     monkeypatch.setenv("OAUTH_ENABLED", "false")

@@ -128,6 +128,7 @@ def oauth_error_response(
     state: Optional[str] = None,
     error_uri: Optional[str] = None,
     audience: Optional[str] = None,
+    resource_metadata: Optional[str] = None,
 ) -> "JSONResponse":
     """Build a `JSONResponse` carrying an OAuth error with the right status code
     and a `WWW-Authenticate` header."""
@@ -135,7 +136,9 @@ def oauth_error_response(
 
     status_code = OAUTH_ERROR_CODES.get(code, 400)
     body = oauth_error(code, description, state=state, error_uri=error_uri)
-    www = build_www_authenticate(code, description, audience=audience)
+    www = build_www_authenticate(
+        code, description, audience=audience, resource_metadata=resource_metadata
+    )
     return _JR(
         status_code=status_code,
         content=body,
@@ -149,6 +152,7 @@ def build_www_authenticate(
     description: Optional[str] = None,
     *,
     audience: Optional[str] = None,
+    resource_metadata: Optional[str] = None,
 ) -> str:
     """Build a `WWW-Authenticate: Bearer ...` header per RFC 6750 §3.
 
@@ -158,6 +162,12 @@ def build_www_authenticate(
 
     Parts are space-separated (which RFC 7235 §2.1 permits) so single-param
     challenges like `Bearer realm="mcp_service"` stay readable.
+
+    `resource_metadata` carries the RFC 9728 protected-resource metadata URL
+    (RFC 9728 §5.1). MCP clients such as ChatGPT/OpenAI connectors rely on it
+    to discover the authorization server after receiving a 401 — without it
+    they cannot start the OAuth flow and fall back to (unsupported) static
+    API keys.
     """
     parts = ["Bearer"]
     if audience:
@@ -167,6 +177,8 @@ def build_www_authenticate(
     if description:
         safe = description.replace('"', "'")
         parts.append(f'error_description="{_ascii(safe)}"')
+    if resource_metadata:
+        parts.append(f'resource_metadata="{_ascii(resource_metadata)}"')
     return " ".join(parts)
 
 
