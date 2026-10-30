@@ -116,6 +116,21 @@ class TestWwwAuthenticate:
         assert '"quotes"' not in h
         assert "'quotes'" in h
 
+    def test_resource_metadata_param(self):
+        """RFC 9728 §5.1 — the challenge advertises the metadata URL so MCP
+        clients (ChatGPT/OpenAI connectors) can discover the AS."""
+        h = build_www_authenticate(
+            "invalid_token", "expired",
+            resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource",
+        )
+        assert (
+            'resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"'
+        ) in h
+
+    def test_resource_metadata_omitted_when_absent(self):
+        h = build_www_authenticate("invalid_token", "expired")
+        assert "resource_metadata" not in h
+
 
 # ─── oauth_error_response builder ─────────────────────────────────────────────
 

@@ -57,11 +57,18 @@ class OAuthConfig:
     )
 
     def get_protected_resource_metadata(self, base_url: Optional[str] = None) -> dict:
-        as_url = base_url or ""
+        # RFC 9728 §2: `resource` must identify the protected resource — for
+        # an MCP server that is the MCP endpoint URL (`{base}/mcp`), not the
+        # bare server origin. `authorization_servers` must list the AS issuer
+        # origins (the client then fetches
+        # `/.well-known/oauth-authorization-server` there itself), not the
+        # metadata document URL.
+        base = (base_url or "").rstrip("/")
         return {
-            "resource": as_url,
-            "authorization_servers": [f"{as_url}/.well-known/oauth-authorization-server"],
+            "resource": f"{base}/mcp" if base else "/mcp",
+            "authorization_servers": [base] if base else [],
             "scopes_supported": self.supported_scopes,
+            "bearer_methods_supported": ["header"],
         }
 
 

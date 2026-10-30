@@ -34,6 +34,7 @@ class AuthorizationCodeData:
     code_challenge_method: str
     expires_at: datetime
     used: bool = False
+    resource: str = ""  # RFC 8707 `resource` param echoed from the authorize request
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def is_expired(self) -> bool:
@@ -70,6 +71,7 @@ class RefreshTokenData:
     client_id: Optional[str]
     scope: str
     expires_at: datetime
+    resource: str = ""  # RFC 8707 — bound at code-exchange time, echoed on refresh
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
     def is_expired(self) -> bool:
@@ -87,12 +89,13 @@ class AuthorizationCodeStore:
         self._last_cleanup = time.time()
 
     def create(self, client_id, redirect_uri, scope, code_challenge,
-               code_challenge_method, ttl=600) -> AuthorizationCodeData:
+               code_challenge_method, ttl=600, resource: str = "") -> AuthorizationCodeData:
         code = secrets.token_urlsafe(32)
         data = AuthorizationCodeData(
             code=code, client_id=client_id, redirect_uri=redirect_uri, scope=scope,
             code_challenge=code_challenge, code_challenge_method=code_challenge_method,
             expires_at=datetime.now(timezone.utc) + timedelta(seconds=ttl),
+            resource=resource,
         )
         with self._lock:
             self._codes[code] = data
@@ -150,6 +153,7 @@ class TokenStore:
                     self._refresh_tokens[token] = RefreshTokenData(
                         token=rd["token"], client_id=rd.get("client_id"),
                         scope=rd["scope"], expires_at=expires_at,
+                        resource=rd.get("resource", ""),
                         created_at=datetime.fromisoformat(rd["created_at"]),
                     )
         except Exception as e:
@@ -168,6 +172,7 @@ class TokenStore:
                 "refresh_tokens": {
                     t: {"token": rd.token, "client_id": rd.client_id, "scope": rd.scope,
                         "expires_at": rd.expires_at.isoformat(),
+                        "resource": rd.resource,
                         "created_at": rd.created_at.isoformat()}
                     for t, rd in self._refresh_tokens.items() if rd.is_valid()
                 },
@@ -179,7 +184,8 @@ class TokenStore:
             _log.warning("Failed to persist token store: %s", e)
 
     def create_access_token(self, client_id, scope, ttl=3600,
-                            create_refresh_token=True, refresh_token_ttl=2592000) -> AccessTokenData:
+                            create_refresh_token=True, refresh_token_ttl=2592000,
+                            resource: str = "") -> AccessTokenData:
         access_token = secrets.token_urlsafe(32)
         refresh_token = None
         if create_refresh_token:
@@ -188,6 +194,7 @@ class TokenStore:
                 self._refresh_tokens[refresh_token] = RefreshTokenData(
                     token=refresh_token, client_id=client_id, scope=scope,
                     expires_at=datetime.now(timezone.utc) + timedelta(seconds=refresh_token_ttl),
+                    resource=resource,
                 )
         data = AccessTokenData(
             token=access_token, client_id=client_id, scope=scope,

@@ -332,10 +332,15 @@ def create_app(handler: Handler, title: str = "MCP Service",
             has_oauth = token is not None
             has_key = mcp_api_key and mcp_api_key == cfg.api_key
             if not has_oauth and not has_key:
+                # RFC 9728 §5.1 — point the client at the protected-resource
+                # metadata so it can discover the authorization server and
+                # start the OAuth flow (required by OpenAI/ChatGPT connectors).
+                base = f"{raw.url.scheme}://{raw.url.netloc}"
                 return oauth_error_response(
                     "invalid_token",
                     "Authentication required: Bearer token or MCP-API-Key",
                     audience=cfg.oauth.audience or "mcp_service",
+                    resource_metadata=f"{base}/.well-known/oauth-protected-resource",
                 )
         user_id = token.user_id if token else None
         return await _dispatch(raw, handler_obj, user_id)

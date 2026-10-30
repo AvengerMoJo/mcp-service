@@ -58,6 +58,33 @@ def _validate_redirect_uri(uri: str) -> bool:
         return False
 
 
+def _validate_resource(uri: Optional[str]) -> bool:
+    """RFC 8707 §2 — `resource` must be an absolute URI (no fragment)."""
+    if not uri:
+        return True
+    try:
+        p = urlparse(uri)
+        return bool(p.scheme) and bool(p.netloc) and "#" not in uri
+    except Exception:
+        return False
+
+
+def _validate_client(client_id: str, redirect_uri: str) -> Optional[str]:
+    """Check `client_id` against registered clients (RFC 6749 §2.2) and enforce
+    that `redirect_uri` exactly matches one of the client's registered URIs
+    (RFC 6749 §3.1.2.2 / OAuth 2.1). Returns an error string or None."""
+    client = get_client_registration_store().get_client(client_id)
+    if client is None:
+        return (
+            "client_id is required"
+            if not client_id
+            else "unknown client_id — register via /oauth/register first"
+        )
+    if redirect_uri not in (client.redirect_uris or []):
+        return "redirect_uri is not registered for this client"
+    return None
+
+
 # ── discovery ─────────────────────────────────────────────────────────────────
 
 @router.get("/.well-known/oauth-authorization-server")
@@ -134,8 +161,9 @@ async def authorize_get(
     state: str,
     code_challenge: str,
     code_challenge_method: str,
+    client_id: str,
     scope: Optional[str] = None,
-    client_id: Optional[str] = None,
+    resource: Optional[str] = None,
 ):
     cfg = get_config()
     if not cfg.oauth.enabled or not cfg.oauth.enable_authorization_server:
@@ -150,21 +178,27 @@ async def authorize_get(
         )
     if not _validate_redirect_uri(redirect_uri):
         return oauth_error_response("invalid_request", "Invalid redirect_uri")
+    client_problem = _validate_client(client_id, redirect_uri)
+    if client_problem:
+        return oauth_error_response("invalid_client", client_problem)
+    if not _validate_resource(resource):
+        return oauth_error_response("invalid_request", "Invalid resource — must be an absolute URI without a fragment")
 
     scope = scope or "mcp:read mcp:write"
 
     if cfg.oauth.auto_approve:
-        return await _approve(request, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method)
+        return await _approve(request, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, resource or "")
 
     return templates.TemplateResponse("authorize.html", {
         "request": request,
-        "client_id": client_id or "MCP Client",
+        "client_id": client_id,
         "redirect_uri": redirect_uri,
         "scope": scope,
         "scopes": scope.split(),
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
+        "resource": resource or "",
     })
 
 
@@ -172,26 +206,27 @@ async def authorize_get(
 async def authorize_post(
     request: Request,
     action: str = Form(...),
-    client_id: Optional[str] = Form(None),
+    client_id: str = Form(...),
     redirect_uri: str = Form(...),
     scope: str = Form(...),
     state: str = Form(...),
     code_challenge: str = Form(...),
     code_challenge_method: str = Form(...),
+    resource: str = Form(""),
 ):
     if action == "deny":
         return RedirectResponse(
             f"{redirect_uri}?{urlencode({'error': 'access_denied', 'state': state})}"
         )
-    return await _approve(request, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method)
+    return await _approve(request, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, resource)
 
 
-async def _approve(request, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method):
+async def _approve(request, client_id, redirect_uri, scope, state, code_challenge, code_challenge_method, resource=""):
     cfg = get_config()
     code_data = get_authorization_code_store().create(
         client_id=client_id, redirect_uri=redirect_uri, scope=scope,
         code_challenge=code_challenge, code_challenge_method=code_challenge_method,
-        ttl=cfg.oauth.authorization_code_ttl,
+        ttl=cfg.oauth.authorization_code_ttl, resource=resource,
     )
     callback_url = f"{redirect_uri}?{urlencode({'code': code_data.code, 'state': state})}"
 
@@ -225,19 +260,20 @@ async def token(
     refresh_token: Optional[str] = Form(None),
     client_id: Optional[str] = Form(None),
     client_secret: Optional[str] = Form(None),
+    resource: Optional[str] = Form(None),
 ):
     cfg = get_config()
     if not cfg.oauth.enabled or not cfg.oauth.enable_authorization_server:
         return oauth_error_response("server_error", "OAuth AS not enabled")
 
     if grant_type == "authorization_code":
-        return await _auth_code_grant(code, redirect_uri, code_verifier, client_id, cfg)
+        return await _auth_code_grant(code, redirect_uri, code_verifier, client_id, resource, cfg)
     if grant_type == "refresh_token":
         return await _refresh_grant(refresh_token, client_id, cfg)
     return oauth_error_response("unsupported_grant_type", f"grant_type {grant_type!r} is not supported")
 
 
-async def _auth_code_grant(code, redirect_uri, code_verifier, client_id, cfg):
+async def _auth_code_grant(code, redirect_uri, code_verifier, client_id, resource, cfg):
     if not code or not redirect_uri or not code_verifier:
         return oauth_error_response(
             "invalid_request",
@@ -247,8 +283,12 @@ async def _auth_code_grant(code, redirect_uri, code_verifier, client_id, cfg):
     code_data = code_store.get(code)
     if not code_data or not code_data.is_valid():
         return oauth_error_response("invalid_grant", "Invalid or expired authorization code")
+    if client_id and code_data.client_id and client_id != code_data.client_id:
+        return oauth_error_response("invalid_grant", "client_id does not match the authorization code")
     if code_data.redirect_uri != redirect_uri:
         return oauth_error_response("invalid_grant", "Redirect URI mismatch")
+    if resource and code_data.resource and resource != code_data.resource:
+        return oauth_error_response("invalid_grant", "resource does not match the authorization code")
     if not is_valid_code_verifier(code_verifier):
         return oauth_error_response("invalid_grant", "Invalid code_verifier format")
     if not verify_code_challenge(code_verifier, code_data.code_challenge, code_data.code_challenge_method):
@@ -257,12 +297,16 @@ async def _auth_code_grant(code, redirect_uri, code_verifier, client_id, cfg):
     td = get_token_store().create_access_token(
         client_id=code_data.client_id, scope=code_data.scope,
         ttl=cfg.oauth.access_token_ttl, refresh_token_ttl=cfg.oauth.refresh_token_ttl,
+        resource=code_data.resource,
     )
-    return _json(TokenResponse(
+    body = TokenResponse(
         access_token=td.token, token_type="Bearer",
         expires_in=td.get_expires_in(), refresh_token=td.refresh_token,
         scope=code_data.scope,
-    ).model_dump())
+    ).model_dump()
+    if code_data.resource:
+        body["resource"] = code_data.resource  # RFC 8707 §3.3 — echo bound resource
+    return _json(body)
 
 
 async def _refresh_grant(refresh_token, client_id, cfg):
@@ -271,12 +315,17 @@ async def _refresh_grant(refresh_token, client_id, cfg):
     rd = get_token_store().get_refresh_token(refresh_token)
     if not rd:
         return oauth_error_response("invalid_grant", "Invalid or expired refresh token")
+    if client_id and rd.client_id and client_id != rd.client_id:
+        return oauth_error_response("invalid_grant", "client_id does not match the refresh token")
     td = get_token_store().create_access_token(
         client_id=rd.client_id, scope=rd.scope,
         ttl=cfg.oauth.access_token_ttl, create_refresh_token=False,
     )
-    return _json(TokenResponse(
+    body = TokenResponse(
         access_token=td.token, token_type="Bearer",
         expires_in=td.get_expires_in(), refresh_token=refresh_token,
         scope=rd.scope,
-    ).model_dump())
+    ).model_dump()
+    if rd.resource:
+        body["resource"] = rd.resource  # RFC 8707 §3.3 — echo bound resource
+    return _json(body)

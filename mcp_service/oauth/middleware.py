@@ -3,7 +3,7 @@
 import logging
 from typing import Optional, Annotated
 
-from fastapi import Depends
+from fastapi import Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from .models import OAuthToken
@@ -13,6 +13,13 @@ from mcp_service.config import get_config
 _log = logging.getLogger(__name__)
 _validator: Optional[TokenValidator] = None
 oauth2_scheme = HTTPBearer(auto_error=False)
+
+
+def _protected_resource_url(request: Request) -> str:
+    """RFC 9728 §5.1 metadata URL for this deployment (scheme/host honor
+    X-Forwarded-Proto/Host via ProxyHeadersMiddleware)."""
+    base = f"{request.url.scheme}://{request.url.netloc}"
+    return f"{base}/.well-known/oauth-protected-resource"
 
 
 def _get_validator() -> TokenValidator:
@@ -38,6 +45,7 @@ async def optional_oauth_token(
 
 
 async def validated_oauth_token(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme),
 ) -> Optional[OAuthToken]:
     if not credentials:
@@ -57,13 +65,15 @@ async def validated_oauth_token(
             detail={"error": e.error_code, "error_description": e.message},
             headers={
                 "WWW-Authenticate": _get_validator().create_www_authenticate_header(
-                    e.error_code, e.message
+                    e.error_code, e.message,
+                    resource_metadata=_protected_resource_url(request),
                 )
             },
         )
 
 
 async def required_oauth_token(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(oauth2_scheme),
 ) -> OAuthToken:
     v = _get_validator()
@@ -75,7 +85,8 @@ async def required_oauth_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error": "invalid_request", "error_description": "Bearer token required"},
             headers={"WWW-Authenticate": v.create_www_authenticate_header(
-                "invalid_request", "Bearer token required"
+                "invalid_request", "Bearer token required",
+                resource_metadata=_protected_resource_url(request),
             )},
         )
     try:
@@ -86,7 +97,8 @@ async def required_oauth_token(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"error": e.error_code, "error_description": e.message},
             headers={"WWW-Authenticate": v.create_www_authenticate_header(
-                e.error_code, e.message
+                e.error_code, e.message,
+                resource_metadata=_protected_resource_url(request),
             )},
         )
 
